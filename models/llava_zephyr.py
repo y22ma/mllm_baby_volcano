@@ -2,22 +2,21 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from .constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from transformers import AutoModel, MistralModel, MistralConfig, MistralForCausalLM, AutoImageProcessor
+from .constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX 
+from transformers import AutoModel, MistralModel, MistralConfig, MistralForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 cuda_available = torch.cuda.is_available()
 device = "cuda" if cuda_available else 'cpu' # the device to load the model onto
 
-class LlavaZephyrModel(MistralForCausalLM):
+class LlavaZephyrModelForCausalLM(MistralForCausalLM):
     def __init__(self, config: MistralConfig):
         super(MistralForCausalLM, self).__init__(config)
         self.config = config
-        self.llm = MistralModel(config)
+        self.model = MistralModel(config)
         self.vis_enc = AutoModel.from_pretrained("facebook/dinov2-large")
-        self.image_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-large")
-        self.image_projector = nn.Linear(config.vis_enc_hidden_dim, config.projector_hidden_dim)
-        self.llm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.image_projector = nn.Linear(self.vis_enc.config.hidden_size, config.hidden_size)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
 
     def forward(
@@ -39,13 +38,13 @@ class LlavaZephyrModel(MistralForCausalLM):
             img_tokens = self._generate_img_tokens(images)
             inputs_embeds = self._combine_image_text_embeds(input_ids, img_tokens)
             if labels is not None:
-                labels = self._combine_image_text_labels(input_ids, img_tokens, labels)
+                new_labels, new_labels_list = self._combine_image_text_labels(input_ids, img_tokens, labels)
+                if attention_mask is not None:
+                    attention_mask = self._combine_image_text_attn_masks(input_ids, labels, new_labels, new_labels_list, attention_mask)
         else:
             inputs_embeds = self.model.embed_tokens(input_ids)
-
         outputs = self.model(
-            input_ids,
-            input_ids=input_ids,
+            input_ids=None,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -54,9 +53,10 @@ class LlavaZephyrModel(MistralForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
+        print("yooo3")
 
         hidden_states = outputs[0]
-        logits = self.llm_head(hidden_states)
+        logits = self.lm_head(hidden_states)
 
         loss = None
         # we're training! set up loss functions
@@ -84,6 +84,8 @@ class LlavaZephyrModel(MistralForCausalLM):
             attentions=outputs.attentions,
         )
 
+    def get_model(self):
+        return self.model
 
     def _combine_image_text_embeds(
         self,
@@ -94,9 +96,8 @@ class LlavaZephyrModel(MistralForCausalLM):
         # insert the image embeddings where the image start token is within the text embeddings
         # while also inserting IGNORE_INDEX label into the modified label tensor at image start token
         new_input_embeds = []
-        new_labels = []
         image_idx = 0
-        for batch_idx, cur_input_ids in enumerate(input_ids):
+        for cur_input_ids in input_ids:
             # lets find all the chunks seperated by the image token index
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
 
@@ -124,6 +125,15 @@ class LlavaZephyrModel(MistralForCausalLM):
             cur_input_embeds = [x.to(device=self.device) for x in cur_input_embeds]
             cur_input_embeds = torch.cat(cur_input_embeds, dim=0)
             new_input_embeds.append(cur_input_embeds)
+        
+        max_len = max(x.shape[0] for x in new_input_embeds)
+
+        new_input_embeds_align = []
+        for cur_new_embed in new_input_embeds:
+            cur_new_embed = torch.cat(
+                (cur_new_embed, torch.zeros((max_len - cur_new_embed.shape[0], cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0)
+            new_input_embeds_align.append(cur_new_embed)
+        new_input_embeds = torch.stack(new_input_embeds_align, dim=0)
 
         return new_input_embeds
 
@@ -166,13 +176,34 @@ class LlavaZephyrModel(MistralForCausalLM):
             cur_new_labels = torch.cat(cur_new_labels, dim=0)
             new_labels.append(cur_new_labels)
 
-        return new_labels
+        max_len = max(x.shape[0] for x in new_labels)
+        new_labels_align = []
+        new_labels_list = new_labels
+        for cur_new_label in new_labels:
+            cur_new_label = torch.cat((cur_new_label, torch.full((max_len - cur_new_label.shape[0],), IGNORE_INDEX, dtype=cur_new_label.dtype, device=cur_new_label.device)), dim=0)
+            new_labels_align.append(cur_new_label)
+        new_labels = torch.stack(new_labels_align, dim=0)
+
+        return new_labels, new_labels_list
+
+
+    def _combine_image_text_attn_masks(
+        self, labels, new_labels, new_labels_list, attention_mask
+    ):
+        new_attention_mask = []
+        for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(attention_mask, new_labels_list, new_labels):
+            new_attn_mask_pad_left = torch.full((cur_new_labels.shape[0] - labels.shape[1],), True, dtype=attention_mask.dtype, device=attention_mask.device)
+            new_attn_mask_pad_right = torch.full((cur_new_labels_align.shape[0] - cur_new_labels.shape[0],), False, dtype=attention_mask.dtype, device=attention_mask.device)
+            cur_new_attention_mask = torch.cat((new_attn_mask_pad_left, cur_attention_mask, new_attn_mask_pad_right), dim=0)
+            new_attention_mask.append(cur_new_attention_mask)
+        attention_mask = torch.stack(new_attention_mask, dim=0)
+
+        return attention_mask
 
     def _generate_img_tokens(self, images: torch.FloatTensor):
         with torch.no_grad():
-            proc_images = self.image_processor(images)
-            img_feat = self.vis_enc(proc_images)
-            Z = img_feat.hidden_states[self.config.img_hidden_states_layer]
+            img_feat = self.vis_enc(images, output_hidden_states=True)
+            Z = img_feat.hidden_states[-1]
         H = self.image_projector(Z)
         return H
 
