@@ -2,18 +2,17 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from .constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX 
-from transformers import AutoModel, MistralModel, MistralConfig, MistralForCausalLM
+from .constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
+from transformers import AutoModel, MistralModel, MistralConfig, MistralForCausalLM, CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-cuda_available = torch.cuda.is_available()
-device = "cuda" if cuda_available else 'cpu' # the device to load the model onto
 
 class LlavaZephyrModelForCausalLM(MistralForCausalLM):
     def __init__(self, config: MistralConfig):
         super(MistralForCausalLM, self).__init__(config)
         self.config = config
         self.model = MistralModel(config)
+        #self.vis_enc = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14-336")
         self.vis_enc = AutoModel.from_pretrained("facebook/dinov2-large")
         self.image_projector = nn.Linear(self.vis_enc.config.hidden_size, config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -32,17 +31,28 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            attention_mask = attention_mask.bool()
+
+        if labels is None:
+            labels = torch.full_like(input_ids, IGNORE_INDEX)
+
         if images is not None:
             # pass the image tensor throught the image encoder and the projector to get the
             # image tokens, referred to as H in the original LLAVA paper
             img_tokens = self._generate_img_tokens(images)
             inputs_embeds = self._combine_image_text_embeds(input_ids, img_tokens)
-            if labels is not None:
-                new_labels, new_labels_list = self._combine_image_text_labels(input_ids, img_tokens, labels)
-                if attention_mask is not None:
-                    attention_mask = self._combine_image_text_attn_masks(input_ids, labels, new_labels, new_labels_list, attention_mask)
+            new_labels, new_labels_list = self._combine_image_text_labels(
+                input_ids, labels, img_tokens)
+            attention_mask = self._combine_image_text_attn_masks(
+                labels, new_labels, new_labels_list, attention_mask)
+            labels = new_labels
         else:
             inputs_embeds = self.model.embed_tokens(input_ids)
+
+        print("forwarding model")
         outputs = self.model(
             input_ids=None,
             attention_mask=attention_mask,
@@ -53,7 +63,7 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
-        print("yooo3")
+        print("llm execution finished")
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
@@ -71,6 +81,8 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+
+        print("loss constructed")
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -101,7 +113,7 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             # lets find all the chunks seperated by the image token index
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
 
-            if len(image_token_indices) > 0:
+            if len(image_token_indices) == 0:
                 cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
                 new_input_embeds.append(cur_input_embeds)
                 image_idx += 1
@@ -109,23 +121,24 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
 
             cur_input_embeds = []
             batch_img_idx = 0
-            image_token_start = image_token_indices[batch_img_idx]
-            while batch_img_idx < image_token_indices:
+            image_token_start = 0
+            while batch_img_idx < len(image_token_indices):
                 cur_img_tokens = img_tokens[image_idx]
-                image_token_start = image_token_indices[batch_img_idx]
-                cur_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:image_token_start]))
+                image_token_end = image_token_indices[batch_img_idx]
+                cur_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[image_token_start:image_token_end]))
                 cur_input_embeds.append(cur_img_tokens)
 
+                image_token_start = image_token_end + 1
                 image_idx += 1
                 batch_img_idx += 1
 
-            if image_token_start + 1 < len(cur_input_ids):
-                cur_input_embeds.append(cur_input_ids[image_token_start + 1:])
+            if image_token_end + 1 < len(cur_input_ids):
+                cur_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[image_token_end + 1:]))
 
             cur_input_embeds = [x.to(device=self.device) for x in cur_input_embeds]
             cur_input_embeds = torch.cat(cur_input_embeds, dim=0)
             new_input_embeds.append(cur_input_embeds)
-        
+
         max_len = max(x.shape[0] for x in new_input_embeds)
 
         new_input_embeds_align = []
@@ -149,7 +162,7 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             # lets find all the chunks seperated by the image token index
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
 
-            if len(image_token_indices) > 0:
+            if len(image_token_indices) == 0:
                 new_labels.append(labels[batch_idx])
                 image_idx += 1
                 continue
@@ -159,19 +172,18 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             assert cur_labels.shape == cur_input_ids.shape
 
             batch_img_idx = 0
-            image_token_start = image_token_indices[batch_img_idx]
-            while batch_img_idx < image_token_indices:
+            image_token_start = 0
+            while batch_img_idx < len(image_token_indices):
                 cur_img_tokens = img_tokens[image_idx]
-                image_token_start = image_token_indices[batch_img_idx]
-                cur_new_labels.append(cur_labels[:image_token_start])
-                cur_new_labels.append(torch.full((cur_img_tokens.shape[0]), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
-                cur_labels = cur_labels[image_token_start+1:]
+                image_token_end = image_token_indices[batch_img_idx]
+                cur_new_labels.append(cur_labels[image_token_start:image_token_end])
+                cur_new_labels.append(torch.full((cur_img_tokens.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
 
                 image_idx += 1
                 batch_img_idx += 1
 
-            if image_token_start + 1 < len(cur_input_ids):
-                cur_new_labels.append(cur_labels)
+            if image_token_end + 1 < len(cur_input_ids):
+                cur_new_labels.append(cur_labels[image_token_end + 1:])
 
             cur_new_labels = torch.cat(cur_new_labels, dim=0)
             new_labels.append(cur_new_labels)
@@ -202,8 +214,9 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
 
     def _generate_img_tokens(self, images: torch.FloatTensor):
         with torch.no_grad():
-            img_feat = self.vis_enc(images, output_hidden_states=True)
+            img_feat = self.vis_enc(images.to(device=self.vis_enc.device, dtype=self.vis_enc.dtype), output_hidden_states=True)
             Z = img_feat.hidden_states[-1]
+            Z = Z[:, 1:]
         H = self.image_projector(Z)
         return H
 
