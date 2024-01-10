@@ -16,4 +16,6 @@ tensorboard
 ftfy
 Jinja2
 datasets
+optimum
 sentencepiece
+accelerate

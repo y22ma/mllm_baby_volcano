@@ -3,20 +3,31 @@ import torch
 import torch.nn as nn
 
 from .constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
-from transformers import AutoModel, MistralModel, MistralConfig, MistralForCausalLM, CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+from transformers import AutoModel, AutoConfig, AutoModelForCausalLM, MistralModel, MistralConfig, MistralForCausalLM, CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from models.modeling_phi import PhiForCausalLM, PhiModel, CausalLMHead
+from models.configuration_phi import PhiConfig
 
 
-class LlavaZephyrModelForCausalLM(MistralForCausalLM):
-    def __init__(self, config: MistralConfig):
-        super(MistralForCausalLM, self).__init__(config)
+class PhiEmbedModel(PhiModel):
+    def __init__(self, config: PhiConfig) -> None:
+        super().__init__(config)
+
+    def embed_tokens(self, input_ids):
+        return super().get_input_embeddings()(input_ids)
+
+class BabyVolcanoModelForCausalLM(PhiForCausalLM):
+    def __init__(self, config: PhiConfig):
+        super(PhiForCausalLM, self).__init__(config)
         self.config = config
-        self.model = MistralModel(config)
-        #self.vis_enc = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14-336")
-        self.vis_enc = AutoModel.from_pretrained("facebook/dinov2-large")
-        self.image_projector = nn.Linear(self.vis_enc.config.hidden_size, config.hidden_size)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.model = PhiEmbedModel(config)
+        self.vis_enc = CLIPVisionModel.from_pretrained(
+            "openai/clip-vit-large-patch14-336",
+            #load_in_8bit=True,
+        )
+        #self.vis_enc = AutoModel.from_pretrained("facebook/dinov2-large")
+        self.image_projector = nn.Linear(self.vis_enc.config.hidden_size, config.n_embd)
+        self.lm_head = CausalLMHead(config).to(dtype=torch.float16)
 
     def forward(
         self,
@@ -58,15 +69,16 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            #use_cache=use_cache,
+            #output_attentions=output_attentions,
+            #output_hidden_states=output_hidden_states,
+            #return_dict=return_dict
         )
         print("llm execution finished")
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        print("Shape of logits:", logits.shape)
 
         loss = None
         # we're training! set up loss functions
@@ -80,6 +92,8 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
             shift_labels = shift_labels.view(-1)
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
+            print("Shape of shift_logits:", shift_logits.shape)
+            print("Shape of shift_labels:", shift_labels.shape)
             loss = loss_fct(shift_logits, shift_labels)
 
         print("loss constructed")
@@ -91,9 +105,8 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
         )
 
     def get_model(self):
