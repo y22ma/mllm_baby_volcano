@@ -7,7 +7,7 @@ import torchvision.transforms as transforms
 import numpy as np
 import datasets
 import transformers
-from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig, BitsAndBytesConfig
 
 from typing import Dict, Optional, Sequence, List
 from PIL import Image
@@ -53,12 +53,12 @@ def tokenize_convos(examples, tokenizer):
     system="A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions."
     wrap_sys = lambda msg: f"<<SYS>>\n{msg}\n<</SYS>>\n\n"
     wrap_inst = lambda msg: f"[INST] {msg} [/INST]"
-    sep=" "
-    sep2="</s>"
+    sep = "<s>"
+    sep2 ="</s>"
 
     prompts = []
-    preprocess_multimodal(copy.deepcopy(examples["conversations"]))
-    for convo in examples["conversations"]:
+    sources = preprocess_multimodal(copy.deepcopy(examples["conversations"]))
+    for convo in sources:
         ret = ""
         for i, message_dict in enumerate(convo):
             message = message_dict["value"]
@@ -147,56 +147,68 @@ def train():
     weight_decay=0.
     num_epochs=1
     save_steps=50000
-    batch_size=16
+    accumulation_steps = 4
+    batch_size=1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("Downloading models!")
-    train_cache_dir = "dataset/"
     model_path = "HuggingFaceH4/zephyr-7b-beta"
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_path,
-        cache_dir=train_cache_dir,
         padding_side="right",
         use_fast=False,
     )
     tokenizer.pad_token = tokenizer.unk_token
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bnb_config_4bit: BitsAndBytesConfig = BitsAndBytesConfig(
+        load_in_4bit=True,
+        load_in_8bit=False,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False,
+        bnb_4bit_compute_dtype="float16",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+
     model = LlavaZephyrModelForCausalLM.from_pretrained(
         model_path,
-        cache_dir=train_cache_dir,
-        torch_dtype=torch.bfloat16,
-    ).to(device=device)
+        torch_dtype=torch.float16,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        quantization_config=bnb_config_4bit
+    )
     model.config.use_cache = False
-    processor = transformers.AutoImageProcessor.from_pretrained(
-        "facebook/dinov2-large")
-    #processor = transformers.CLIPImageProcessor.from_pretrained(
-    #    "openai/clip-vit-large-patch14-336")
+    model.set_vis_enc()
+    #processor = transformers.AutoImageProcessor.from_pretrained(
+    #    "facebook/dinov2-large")
+    processor = transformers.CLIPImageProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14-336")
 
     # loading dataset
     print("Downloading dataset json!")
     dataset_path = "liuhaotian/LLaVA-Pretrain"
-    #dataset_path = "y22ma/LLAVA-Test"
     dataset = datasets.load_dataset(
-        dataset_path, data_files=["blip_laion_cc_sbu_558k.json"], cache_dir="dataset/")
+        dataset_path, data_files=["blip_laion_cc_sbu_558k.json"])
+    #dataset_path = "y22ma/LLAVA-Test"
     #dataset = datasets.load_dataset(
-    #    dataset_path, data_files=["test.json"], cache_dir=train_cache_dir)
+    #    dataset_path, data_files=["test.json"])
     proc_convo = dataset["train"].map(
         lambda examples: tokenize_convos(examples, tokenizer),
         batched=True, batch_size=16)
 
-    print("Downloading images!")
-    images = datasets.load_dataset(dataset_path, data_files=["images.zip"], cache_dir=train_cache_dir)
-    print("loaded images")
+    images = datasets.load_dataset(dataset_path, data_files=["images.zip"])
     images = images.cast_column("image", datasets.Image(decode=False))
-    print("casted images to paths")
     path_divs = images["train"]["image"][0]["path"].split('/')
-    image_folder = os.path.join(*path_divs[:-2])
+    image_folder = os.path.join("/", *path_divs[:-2])
     print(image_folder)
+
+    del images
+    torch.cuda.empty_cache()
 
     # training loop!
     print("Starting Training!")
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        learning_rate=learning_rate,
+        lr=learning_rate,
         weight_decay=weight_decay
     )
     criterion = torch.nn.CrossEntropyLoss()
@@ -214,18 +226,35 @@ def train():
                 images = []
                 for img_path in batch["image"]:
                     full_path = os.path.join(image_folder, img_path)
+                    if not os.path.exists(full_path):
+                        images = None
+                        break
+
                     image = Image.open(full_path).convert('RGB')
                     image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
                     image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                     images.append(image)
-                images = torch.stack(images).to(dtype=torch.bfloat16, device=device)
 
-            outputs = model(inputs, attention_mask=attention_mask, labels=labels, images=images)
-            loss = outputs.loss
+                if images is not None:
+                    images = torch.stack(images).to(dtype=torch.float16, device=device)
+                else:
+                    continue
 
-            optimizer.zero_grad()
+            outputs = model(inputs, attention_mask=attention_mask, labels=labels, images=images, return_dict=True)
+            loss = outputs.loss / accumulation_steps
             loss.backward()
-            optimizer.step()
+            if (step + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
             step = step + 1
             print(f"Epoch {epoch+1} step {step} Loss - {loss.item()}")
+
+            del images
+            del labels
+            del attention_mask
+            del inputs
+            del outputs
+            torch.cuda.empty_cache()
+if __name__ == "__main__":
+    train()
 

@@ -11,12 +11,13 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
     def __init__(self, config: MistralConfig):
         super(MistralForCausalLM, self).__init__(config)
         self.config = config
+        print(self.config)
         self.model = MistralModel(config)
-        #self.vis_enc = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14-336")
-        self.vis_enc = AutoModel.from_pretrained("facebook/dinov2-large")
-        self.image_projector = nn.Linear(self.vis_enc.config.hidden_size, config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def set_vis_enc(self):
+        self.vis_enc = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14-336")
+        self.image_projector = nn.Linear(self.vis_enc.config.hidden_size, self.config.hidden_size)
 
     def forward(
         self,
@@ -65,7 +66,7 @@ class LlavaZephyrModelForCausalLM(MistralForCausalLM):
         )
         print("llm execution finished")
 
-        hidden_states = outputs[0]
+        hidden_states = outputs.last_hidden_state.to(dtype=torch.float16)
         logits = self.lm_head(hidden_states)
 
         loss = None
